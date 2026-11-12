@@ -397,7 +397,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     std::vector<std::string> hostLibraries;
     std::vector<std::vector<std::string>> moduleHostLibraries(images.size());
     std::set<std::string> uniqueHosts;
-    const auto hostLibrary = [&](const std::string& name) { return windows || macos ? name : Domain::NeededLibraryName(name); };
+    const auto hostLibrary = [&](const std::string& name) { return windows ? name : Domain::NeededLibraryName(name); };
     std::vector<std::filesystem::path> runDirectories;
     bool runDirectoriesExist = !windows && !macos;
     for (std::size_t begin = 0; runDirectoriesExist && begin <= runPath.size();) {
@@ -442,7 +442,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         for (const auto& dependency : images[index].Dependencies) {
             if (unavailableUnused(index, dependency)) continue;
             addHost(dependency, windows || !deferred(index));
-            if (findGuest(dependency) == guestNames.end()) hosts.push_back(hostLibrary(dependency));
+            if (const auto host = hostLibrary(dependency); findGuest(dependency) == guestNames.end() && std::find(hosts.begin(), hosts.end(), host) == hosts.end()) hosts.push_back(host);
         }
         if (!windows && !macos && images[index].HasInit) {
             if (std::find(hosts.begin(), hosts.end(), "libkernel.prx") == hosts.end()) hosts.push_back("libkernel.prx");

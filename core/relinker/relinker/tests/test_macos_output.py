@@ -15,6 +15,7 @@ from import_fixture import fixture as import_fixture
 from nid import nid
 from tls_fixture import fixture as tls_fixture
 from test_guest_module_directories import module_with_symbol
+from test_guest_needed_modules import module_with_needed
 
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_TYPE_X86_64 = 0x01000007
@@ -162,10 +163,29 @@ def check_runtime_dependencies(relinker, directory):
             (b"libc.prx", ["@rpath/libc.prx", "@rpath/libkernel.prx"]),
             (b"libkernel.prx", ["@rpath/libkernel.prx", "@rpath/libc.prx"]),
             (b"libSceLibcInternal.prx", ["@rpath/libSceLibcInternal.prx", "@rpath/libkernel.prx", "@rpath/libc.prx"]),
-            (b"libSceVideoOut.prx", ["@rpath/libSceVideoOut.prx", "@rpath/libkernel.prx", "@rpath/libc.prx"])):
+            (b"libSceVideoOut.prx", ["@rpath/libSceVideoOut.prx", "@rpath/libkernel.prx", "@rpath/libc.prx"]),
+            (b"libkernel.sprx", ["@rpath/libkernel.prx", "@rpath/libc.prx"]),
+            (b"libSceLibcInternal.suprx", ["@rpath/libSceLibcInternal.prx", "@rpath/libkernel.prx", "@rpath/libc.prx"]),
+            (b"libSceVideoOut.debug_prx", ["@rpath/libSceVideoOut.prx", "@rpath/libkernel.prx", "@rpath/libc.prx"])):
         name = needed.decode().removesuffix(".prx")
         dylibs = [dylib for dylib in check_structure(name, relink(relinker, directory, name, import_fixture(library=needed))).dylibs if dylib.startswith("@rpath/")]
         check(dylibs == expected, f"{name}: dependencies {dylibs}, expected {expected}")
+
+
+def check_guest_dependencies(relinker, directory):
+    for suffix in ("prx", "sprx", "suprx", "debug_prx"):
+        case = Path(directory) / f"guest-{suffix}"
+        (case / "sce_module").mkdir(parents=True)
+        source = case / "input.elf"
+        source.write_bytes(bytes(import_fixture(library=f"libkernel.{suffix}".encode())))
+        (case / "sce_module" / "module.prx").write_bytes(module_with_needed((f"libSceLibcInternal.{suffix}".encode(), b"libSceLibcInternal.prx"), (0, 1)))
+        result = subprocess.run([str(relinker), "--macos", str(source), str(case / "output")], capture_output=True, text=True, timeout=20)
+        check(result.returncode == 0, f"guest-{suffix}: {result.stdout}{result.stderr}")
+        for path, expected in (
+                ("output", ["@rpath/libkernel.prx", "@rpath/libSceLibcInternal.prx", "@rpath/libc.prx"]),
+                ("app0/sce_module/module.prx.guest.prx", ["@rpath/libSceLibcInternal.prx", "@rpath/libc.prx", "@rpath/libkernel.prx"])):
+            dylibs = [dylib for dylib in MachO((case / path).read_bytes()).dylibs if dylib.startswith("@rpath/")]
+            check(dylibs == expected, f"guest-{suffix}: {path} dependencies {dylibs}, expected {expected}")
 
 
 def check_tls(data):
@@ -294,6 +314,7 @@ def main():
         check_imports(imported)
         check_signed_entry(directory, imported)
         check_runtime_dependencies(relinker, directory)
+        check_guest_dependencies(relinker, directory)
         check_tls(relink(relinker, directory, "tls", tls_fixture()))
         check_options(relinker, directory)
         check_runpath_lists(relinker, directory)
