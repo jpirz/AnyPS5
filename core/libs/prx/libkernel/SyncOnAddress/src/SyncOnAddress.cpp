@@ -263,9 +263,7 @@ int WaitOnAddress(TValue* address, TValue expected, KernelUseconds* timeout, con
     return woken ? SYNC_ON_ADDRESS_OK : SCE_KERNEL_ERROR_ETIMEDOUT;
 }
 
-std::int32_t WakeAddressLocked(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
-    auto& bucket = BucketOf(key);
-    std::lock_guard<std::mutex> lock(bucket.mutex);
+std::int32_t WakeWaiters(WaiterBucket& bucket, std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
     const auto entry = bucket.waiters.find(key);
     if (entry == bucket.waiters.end()) {
         return 0;
@@ -286,7 +284,11 @@ std::int32_t WakeAddressLocked(std::uintptr_t key, std::int32_t count, bool wake
 
 std::int32_t WakeAddress(std::uintptr_t key, std::int32_t count, bool wakesAtLeastOne) {
     std::int32_t woken = 0;
-    DeferringDelivery([&] { woken = WakeAddressLocked(key, count, wakesAtLeastOne); });
+    DeferringDelivery([&] {
+        auto& bucket = BucketOf(key);
+        std::lock_guard<std::mutex> lock(bucket.mutex);
+        woken = WakeWaiters(bucket, key, count, wakesAtLeastOne);
+    });
     return woken;
 }
 
@@ -432,9 +434,7 @@ std::uint32_t CurrentOwnerId() {
     return static_cast<std::uint32_t>(scePthreadGetthreadid()) & ~UMUTEX_CONTESTED;
 }
 
-std::size_t WaiterCount(std::uintptr_t key) {
-    auto& bucket = BucketOf(key);
-    std::lock_guard<std::mutex> lock(bucket.mutex);
+std::size_t WaiterCount(const WaiterBucket& bucket, std::uintptr_t key) {
     const auto entry = bucket.waiters.find(key);
     return entry == bucket.waiters.end() ? 0 : entry->second.size();
 }
@@ -473,11 +473,12 @@ bool TryAcquireMutex(UserMutex* mutex, std::uint32_t id, int& error) {
     }
 }
 
-void MarkContested(UserMutex* mutex) {
+bool MarkContested(UserMutex* mutex) {
     std::atomic_ref<std::uint32_t> owner(mutex->owner);
     std::uint32_t current = owner.load();
     while (current != UMUTEX_UNOWNED && (current & UMUTEX_CONTESTED) == 0 && !owner.compare_exchange_weak(current, current | UMUTEX_CONTESTED)) {
     }
+    return (current & ~UMUTEX_CONTESTED) != 0;
 }
 
 int MutexTrylock(UserMutex* mutex) {
@@ -507,6 +508,7 @@ int MutexLock(UserMutex* mutex, bool acquire, const void* sizeArgument, const vo
     const auto key = reinterpret_cast<std::uintptr_t>(&mutex->owner);
     for (;;) {
         bool done = false;
+        bool retry = false;
         int error = 0;
         const bool woken = WaitOnKeyUntil(key, [&] {
             if (acquire) {
@@ -515,13 +517,14 @@ int MutexLock(UserMutex* mutex, bool acquire, const void* sizeArgument, const vo
                 const std::uint32_t current = std::atomic_ref<std::uint32_t>(mutex->owner).load();
                 done = current == UMUTEX_UNOWNED || current == UMUTEX_CONTESTED;
             }
-            if (!done) {
-                MarkContested(mutex);
-            }
-            return done;
+            retry = !done && !MarkContested(mutex);
+            return done || retry;
         }, deadline, caller);
         if (done) {
             return 0;
+        }
+        if (retry) {
+            continue;
         }
         if (!woken) {
             return GUEST_ETIMEDOUT;
@@ -544,8 +547,12 @@ int MutexUnlock(UserMutex* mutex) {
         return GUEST_EPERM;
     }
     const auto key = reinterpret_cast<std::uintptr_t>(&mutex->owner);
-    owner.store(WaiterCount(key) > 1 ? UMUTEX_CONTESTED : UMUTEX_UNOWNED);
-    WakeAddress(key, 1, false);
+    DeferringDelivery([&] {
+        auto& bucket = BucketOf(key);
+        std::lock_guard<std::mutex> lock(bucket.mutex);
+        owner.store(WaiterCount(bucket, key) > 1 ? UMUTEX_CONTESTED : UMUTEX_UNOWNED);
+        WakeWaiters(bucket, key, 1, false);
+    });
     return 0;
 }
 
@@ -558,11 +565,15 @@ int MutexWake(UserMutex* mutex) {
         return 0;
     }
     const auto key = reinterpret_cast<std::uintptr_t>(&mutex->owner);
-    if (WaiterCount(key) <= 1) {
-        std::uint32_t contested = UMUTEX_CONTESTED;
-        owner.compare_exchange_strong(contested, UMUTEX_UNOWNED);
-    }
-    WakeAddress(key, 1, false);
+    DeferringDelivery([&] {
+        auto& bucket = BucketOf(key);
+        std::lock_guard<std::mutex> lock(bucket.mutex);
+        if (WaiterCount(bucket, key) <= 1) {
+            std::uint32_t contested = UMUTEX_CONTESTED;
+            owner.compare_exchange_strong(contested, UMUTEX_UNOWNED);
+        }
+        WakeWaiters(bucket, key, 1, false);
+    });
     return 0;
 }
 
