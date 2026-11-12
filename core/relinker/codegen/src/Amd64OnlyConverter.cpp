@@ -311,6 +311,7 @@ std::set<std::uint64_t> Amd64OnlyConverter::_collectBranchTargets(
     };
     const X64InstructionDecoder decoder;
     std::set<std::uint64_t> targets;
+    std::set<std::uint64_t> tables;
     for (const auto& match : matches) {
         const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
         const auto next = ph.MappedAddress + match.Offset + info.Length;
@@ -325,6 +326,8 @@ std::set<std::uint64_t> Amd64OnlyConverter::_collectBranchTargets(
             std::memcpy(&displacement, seg.data() + match.Offset + info.RipRelativeDispOffset, sizeof(displacement));
             auto table = next + static_cast<std::uint64_t>(displacement);
             if (info.AddressSize32) table = static_cast<std::uint32_t>(table);
+            if (!tables.insert(table).second)
+                continue;
             for (const auto& data : segments) {
                 if (data.Type != kLoadSegment || table < data.MappedAddress || table - data.MappedAddress >= data.FileSize)
                     continue;
@@ -334,7 +337,7 @@ std::set<std::uint64_t> Amd64OnlyConverter::_collectBranchTargets(
                     std::int32_t relative;
                     std::memcpy(&relative, fileBytes.data() + data.Offset + (entry - data.MappedAddress), sizeof(relative));
                     const auto target = table + static_cast<std::uint64_t>(static_cast<std::int64_t>(relative));
-                    if (!startsInstruction(target))
+                    if ((target >= table && target < entry + sizeof(relative)) || !startsInstruction(target))
                         break;
                     targets.insert(target);
                 }

@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -1271,11 +1272,54 @@ void converterJumpTableTargets() {
 
     require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}, {0x330, store}}, {code, data}), 0x210), "A 256-bit store moved the instruction after it although a jump table enters that instruction");
     require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1019, 0x1018})}}, {code, data}), 0x214), "A jump table was read past an entry that does not start an instruction");
+    for (const std::uint64_t inside : {0x1113, 0x1115})
+        require(placedAt(convert({0x48, 0x8D, 0x0D, 0x0C, 0x01, 0x00, 0x00}, {{0x313, table(0x1113, {inside, 0x1018})}}, {{1, 5, 0x200, 0x1000, 0, 0x120, 0x120, 16}}), 0x214), "A jump table in the code segment was read past an entry that points into the table");
     require(placedAt(convert({0x48, 0x8B, 0x0D, 0xF9, 0x1F, 0x00, 0x00}, {{0x300, table(0x3000, {0x1010, 0x1018})}}, {code, data}), 0x214), "A jump table was read at an address loaded rather than formed by LEA");
     require(placedAt(convert({0x48, 0x8D, 0x0D, 0xF7, 0x1F, 0x00, 0x00}, {{0x2FE, table(0x2FFE, {0x1018})}}, {code, data}), 0x214), "A jump table was read at an address outside every segment");
     require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010})}, {0x380, table(0x3000, {0x1018})}}, {code, data, {0x61000000, 4, 0x380, 0x3000, 0, 0x10, 0x10, 16}}), 0x214), "A jump table was read from a segment that is not loaded");
     require(placedAt(convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}, {0x3A0, store}}, {code, data, {2, 5, 0x3A0, 0x2000, 0, 4, 4, 16}}), 0x210), "A segment that is not loaded was converted");
     requireFailure([&] { (void)convert(leaTable, {{0x300, table(0x3000, {0x1010, 0x1018})}}, {code, {1, 4, 0x300, 0x3000, 0, 0x1000, 0x1000, 16}}); }, "A jump table was read from a segment that exceeds the file");
+}
+
+void converterJumpTableScale() {
+    const auto converter = Codegen::MakeAmd64OnlyConverter();
+    constexpr std::size_t leaCount = 20000;
+    constexpr std::size_t tableSize = 0x40000;
+    constexpr std::uint64_t codeAddress = 0x10000;
+    constexpr std::uint64_t dataAddress = 0x10000000;
+    for (const bool zeroRun : {false, true}) {
+        Bytes code = {0x66, 0x0F, 0x78, 0xC0, 0x08, 0x00};
+        const auto ret = codeAddress + code.size() + leaCount * 7;
+        const auto run = ret + 1;
+        for (std::size_t index = 0; index < leaCount; ++index) {
+            const auto table = zeroRun ? run + index * 4 : dataAddress;
+            const auto relative = static_cast<std::uint32_t>(table - (codeAddress + code.size() + 7));
+            code.insert(code.end(), {0x48, 0x8D, 0x05});
+            for (std::size_t byte = 0; byte < 4; ++byte)
+                code.push_back(static_cast<std::uint8_t>(relative >> (byte * 8)));
+        }
+        code.push_back(0xC3);
+        if (zeroRun)
+            code.resize(code.size() + tableSize);
+        Bytes file(0x1000, 0);
+        file.insert(file.end(), code.begin(), code.end());
+        file.resize(0x1000 + (code.size() + 0xFFF) / 0x1000 * 0x1000);
+        const auto dataOffset = file.size();
+        for (std::size_t entry = 0; entry < tableSize; entry += 4) {
+            const auto relative = static_cast<std::uint32_t>(ret - dataAddress);
+            for (std::size_t byte = 0; byte < 4; ++byte)
+                file.push_back(static_cast<std::uint8_t>(relative >> (byte * 8)));
+        }
+        const Domain::ProgramHeader text{1, 5, 0x1000, codeAddress, 0, code.size(), code.size(), 0x1000};
+        const Domain::ProgramHeader data{1, 4, dataOffset, dataAddress, 0, tableSize, tableSize, 0x1000};
+
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = converter->Convert(file, {text, data});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+
+        require(result.Trampolines.size() == 1 && result.Trampolines[0].Offset == 0x1000, "Many LEAs to jump tables converted the wrong site");
+        require(elapsed < std::chrono::seconds(10), "Many LEAs to jump tables took too long to convert");
+    }
 }
 
 void converterRosetta() {
@@ -2565,6 +2609,7 @@ int main() {
         converterIslandInTrapPadding();
         converterClaimedFollower();
         converterJumpTableTargets();
+        converterJumpTableScale();
         converterReciprocal();
         converterStrayRex();
         rewriterStrayRex();
