@@ -16,6 +16,8 @@ namespace Elfpatcher::Linux {
 
 inline constexpr std::uint64_t DefaultFixedBase = 0x400000;
 
+std::uint64_t SeparateSharedLoadPages(std::vector<std::uint8_t>& buf, std::vector<Domain::ProgramHeader>& headers);
+
 class LinuxElfPatcher : public IElfPatcher {
 public:
     LinuxElfPatcher(

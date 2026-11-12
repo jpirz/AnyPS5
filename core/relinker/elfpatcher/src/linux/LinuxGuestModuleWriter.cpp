@@ -1,6 +1,7 @@
 #include <elfpatcher/general/GuestModuleWriter.hpp>
 #include <elfpatcher/general/AddressDistance.hpp>
 #include <elfpatcher/general/ElfConstants.hpp>
+#include <elfpatcher/linux/LinuxElfPatcher.hpp>
 #include <codegen/x86/Amd64OnlySubstitutionTable.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <io/BufferUtils.hpp>
@@ -19,7 +20,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
         if (header.Type != 1 && header.Type != 7 && header.Type != 0x6474e550 && header.Type != PT_GNU_STACK) continue;
         if (header.Type == 1) {
             end = std::max(end, header.MappedAddress + header.MemorySize);
-            if (header.Flags == 0) continue;
+            if (header.Flags == 0 || header.MemorySize == 0) continue;
             header.Flags |= 4;
         }
         if (header.Type == 7) header.Alignment = std::max<std::uint64_t>(header.Alignment, 1);
@@ -360,18 +361,25 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteLinux(const Relinker::GuestIma
     const auto phCount = headers.size() + 2;
     if (phCount > std::numeric_limits<std::uint16_t>::max()) throw Domain::RelinkerException("Too many guest program headers");
     const auto extraSize = bytes.size() + phCount * 56 - extraOffset;
+    bytes.resize(phOffset + phCount * 56);
+    Linux::SeparateSharedLoadPages(bytes, headers);
+    for (auto& header : headers)
+        if (header.Type == 1 && (header.Alignment == 0 || header.Alignment % kDefaultLoadAlignment != 0))
+            header.Alignment = kDefaultLoadAlignment;
     headers.push_back({1, 7, extraOffset, extraAddress, extraAddress, extraSize, extraSize, 0x4000});
     headers.push_back({2, 6, dynamicOffset, dynamicAddress, dynamicAddress, dynamicSize, dynamicSize, 8});
+    std::vector<std::uint8_t> table;
     for (const auto& header : headers) {
-        Io::AppendU32(bytes, header.Type);
-        Io::AppendU32(bytes, header.Flags);
-        Io::AppendU64(bytes, header.Offset);
-        Io::AppendU64(bytes, header.MappedAddress);
-        Io::AppendU64(bytes, header.PhysicalAddress);
-        Io::AppendU64(bytes, header.FileSize);
-        Io::AppendU64(bytes, header.MemorySize);
-        Io::AppendU64(bytes, header.Alignment);
+        Io::AppendU32(table, header.Type);
+        Io::AppendU32(table, header.Flags);
+        Io::AppendU64(table, header.Offset);
+        Io::AppendU64(table, header.MappedAddress);
+        Io::AppendU64(table, header.PhysicalAddress);
+        Io::AppendU64(table, header.FileSize);
+        Io::AppendU64(table, header.MemorySize);
+        Io::AppendU64(table, header.Alignment);
     }
+    std::copy(table.begin(), table.end(), bytes.begin() + static_cast<std::ptrdiff_t>(phOffset));
     std::fill_n(bytes.begin() + 7, 9, std::uint8_t{0});
     Io::WriteU16(bytes, 16, 3);
     Io::WriteU64(bytes, 24, 0);

@@ -223,6 +223,19 @@ void IncongruentSegmentWithoutFileBytes() {
     RequireImage(output, source, headers, "segment without file bytes whose offset differs within its page");
 }
 
+void IncongruentSegmentWithoutFileBytesAtPageStart() {
+    auto source = Fixture(0x3000);
+    std::fill(source.begin() + 0x1000, source.begin() + 0x1800, std::uint8_t{0xAA});
+    std::fill(source.begin() + 0x700, source.begin() + 0x800, std::uint8_t{0x77});
+    const std::vector<Domain::ProgramHeader> headers{
+        Load(0x400, 0x400, 0x10, 0x10, 5),
+        Load(0x1000, 0x1000, 0x800, 0x800, 6),
+        Load(0x700, 0x3000, 0, 0x100, 6, 0x100),
+    };
+    const auto output = Patcher().Patch(source, headers, {}, 0, "$ORIGIN/libs", true, false, {});
+    RequireImage(output, source, headers, "segment without file bytes at a page start whose offset lies inside a page");
+}
+
 void ZeroPageBelowASegmentWithoutFileBytesStaysInPlace() {
     auto source = Fixture(0x3000);
     const std::vector<Domain::ProgramHeader> headers{
@@ -420,6 +433,7 @@ int main() {
         DataBelowASegmentWithoutFileBytes();
         ZeroFillBelowASegmentWithoutFileBytes();
         IncongruentSegmentWithoutFileBytes();
+        IncongruentSegmentWithoutFileBytesAtPageStart();
         ZeroPageBelowASegmentWithoutFileBytesStaysInPlace();
         TrampolineDisplacementAcrossInt64Max();
         TrampolineDisplacementBeyondInt64Range();

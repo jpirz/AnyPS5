@@ -141,6 +141,8 @@ std::uint64_t RelocationWidth(const std::vector<std::uint8_t>& relocations, cons
     return type == R_X86_64_PC32 || type == R_X86_64_32 ? 4 : 8;
 }
 
+}
+
 std::uint64_t SeparateSharedLoadPages(std::vector<std::uint8_t>& buf, std::vector<Domain::ProgramHeader>& headers) {
     std::vector<std::size_t> loads;
     for (std::size_t index = 0; index < headers.size(); ++index) {
@@ -195,7 +197,7 @@ std::uint64_t SeparateSharedLoadPages(std::vector<std::uint8_t>& buf, std::vecto
         auto& load = headers[loads[position]];
         const auto prefix = load.MappedAddress % kDefaultLoadAlignment;
         const bool congruent = load.Offset % kDefaultLoadAlignment == prefix;
-        if ((load.FileSize == 0 || congruent) && prefix == 0)
+        if (congruent && prefix == 0)
             continue;
         const auto pageStart = load.MappedAddress - prefix;
         std::vector<std::uint8_t> image(static_cast<std::size_t>(prefix), 0);
@@ -229,6 +231,8 @@ std::uint64_t SeparateSharedLoadPages(std::vector<std::uint8_t>& buf, std::vecto
     }
     return lowered;
 }
+
+namespace {
 
 struct TracedImport {
     std::uint64_t Slot;
