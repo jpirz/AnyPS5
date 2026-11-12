@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <link.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fstream>
 #include <sstream>
@@ -1320,6 +1321,25 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         Unmap(mapped, len);
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
     }
+#ifdef __linux__
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0) {
+        const int error = errno;
+        Unmap(mapped, len);
+        throw std::system_error(error, std::generic_category(), "map file: read the file size");
+    }
+    const auto fileEnd = static_cast<std::uint64_t>(status.st_size);
+    if (fileEnd > offset && fileEnd - offset < len) {
+        const auto hostPageMask = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE)) - 1;
+        const auto zeroStart = (fileEnd - offset + hostPageMask) & ~hostPageMask;
+        const auto zeroEnd = (fileEnd - offset + PS5_PAGE_SIZE - 1) & ~static_cast<std::uint64_t>(PS5_PAGE_SIZE - 1);
+        if (zeroStart < zeroEnd && ::mmap(static_cast<char*>(mapped) + zeroStart, zeroEnd - zeroStart, mappedProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+            const int error = errno;
+            Unmap(mapped, len);
+            throw std::system_error(error, std::generic_category(), "map zero pages past the end of a file");
+        }
+    }
+#endif
     if (mappedProtection != nativeProtection && ::mprotect(mapped, len, nativeProtection) != 0) {
         const int error = errno;
         Unmap(mapped, len);

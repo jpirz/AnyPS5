@@ -3660,20 +3660,24 @@ static void CheckRegularFileMapping() {
     Require(munmap_nid_postfix(const_cast<unsigned char*>(readable), page) == 0);
     Require(sceKernelClose(readOnly) == 0);
     constexpr std::size_t tail = 0x1100;
-    constexpr std::size_t hostPage = 0x1000;
     std::filesystem::resize_file(path, page + tail);
     const int partial = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
     Require(partial >= 0);
     auto* rounded = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page * 2, 1, 0x1, partial, 0));
     Require(rounded != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)));
     Require(rounded[5] == 0x77 && rounded[page] == 0x22 && rounded[page + 7] == 0x33 && rounded[page + tail - 1] == 0x22);
-    for (std::size_t at = page + tail; at < page + 2 * hostPage; ++at) Require(rounded[at] == 0);
+    for (std::size_t at = page + tail; at < page * 2; ++at) Require(rounded[at] == 0);
 #ifdef _WIN32
-    for (std::size_t at = page + 2 * hostPage; at < page * 2; ++at) Require(rounded[at] == 0);
     *__error_nid_postfix() = 0;
     Require(mmap_nid_postfix(nullptr, page * 3, 1, 0x1, partial, 0) == reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && *__error_nid_postfix() == 45);
 #endif
     Require(munmap_nid_postfix(const_cast<unsigned char*>(rounded), page * 2) == 0);
+    auto* privateTail = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page * 2, 3, 0x2, partial, 0));
+    Require(privateTail != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && privateTail[page + tail - 1] == 0x22);
+    for (std::size_t at = page + tail; at < page * 2; ++at) Require(privateTail[at] == 0);
+    privateTail[page * 2 - 1] = 0x66;
+    Require(privateTail[page * 2 - 1] == 0x66);
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(privateTail), page * 2) == 0);
     Require(sceKernelClose(partial) == 0);
     Require(std::filesystem::file_size(path) == page + tail);
     const int partialWritable = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDWR, 0);
@@ -3685,14 +3689,25 @@ static void CheckRegularFileMapping() {
     Require(roundedWritable[page + tail - 2] == 0x44);
     roundedWritable[page + tail - 1] = 0x55;
     roundedWritable[page + tail] = 0x66;
-#ifdef _WIN32
     roundedWritable[page * 2 - 1] = 0x66;
     Require(roundedWritable[page * 2 - 1] == 0x66);
-#endif
     Require(munmap_nid_postfix(const_cast<unsigned char*>(roundedWritable), page * 2) == 0);
     Require(byteAt(partialWritable, page + tail - 1) == 0x55);
     Require(sceKernelClose(partialWritable) == 0);
     Require(std::filesystem::file_size(path) == page + tail);
+#ifndef _WIN32
+    const int growing = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDWR, 0);
+    Require(growing >= 0);
+    auto* beyond = static_cast<volatile unsigned char*>(mmap_nid_postfix(nullptr, page * 3, 1, 0x1, growing, 0));
+    Require(beyond != reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1)) && beyond[page * 2 - 1] == 0);
+    constexpr std::size_t hostPage = 0x1000;
+    Require(sceKernelPwrite(growing, &nearEnd, 1, page * 2) == 1);
+    Require(sceKernelPwrite(growing, &nearEnd, 1, page + tail) == 1);
+    Require(sceKernelPwrite(growing, &nearEnd, 1, page + 2 * hostPage) == 1);
+    Require(beyond[page * 2] == 0x44 && beyond[page + tail] == 0x44 && beyond[page + 2 * hostPage] == 0);
+    Require(munmap_nid_postfix(const_cast<unsigned char*>(beyond), page * 3) == 0);
+    Require(sceKernelClose(growing) == 0);
+#endif
     int ends[2] = {-1, -1};
 #ifdef _WIN32
     Require(_pipe(ends, 4096, _O_BINARY) == 0);
