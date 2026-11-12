@@ -14,6 +14,11 @@ struct Cie {
     VirtualAddress Personality = 0;
 };
 
+struct LsdaLandings {
+    bool Signed = false;
+    std::vector<std::uint64_t> Landings;
+};
+
 class Reader {
 public:
     Reader(const std::vector<std::uint8_t>& bytes, const std::vector<ProgramHeader>& headers, const std::map<VirtualAddress, VirtualAddress>& pointers, const std::set<VirtualAddress>& importSlots) : bytes(bytes), headers(headers), pointers(pointers), importSlots(importSlots) {}
@@ -54,6 +59,10 @@ private:
     const std::map<VirtualAddress, VirtualAddress>& pointers;
     const std::set<VirtualAddress>& importSlots;
     std::map<VirtualAddress, Cie> cies;
+    std::map<VirtualAddress, LsdaLandings> lsdaLandings;
+    bool cacheLsdas = false;
+    std::uint64_t parsedCallSiteBytes = 0;
+    std::uint64_t landingPads = 0;
 
     VirtualAddress checkedRangeEnd(VirtualAddress address, std::uint64_t size) const {
         if (size > std::numeric_limits<VirtualAddress>::max() - address)
@@ -237,10 +246,16 @@ private:
         return region;
     }
 
-    void readLsda(VirtualAddress address, StrictCodeRegion& region) const {
+    void readLsda(VirtualAddress address, StrictCodeRegion& region) {
         auto position = address;
         const auto landingEncoding = read<std::uint8_t>(position);
         const auto landingBase = landingEncoding == 0xFF ? region.Begin : encoded(position, landingEncoding, 0, region.Begin);
+        const auto first = region.ExtraTargets.size();
+        if (const auto found = lsdaLandings.find(address); found != lsdaLandings.end()) {
+            for (const auto landing : found->second.Landings) region.ExtraTargets.push_back(landingPad(address, found->second.Signed, landingBase, landing));
+            countLandingPads(address, region.ExtraTargets.size() - first);
+            return;
+        }
         const auto typeEncoding = read<std::uint8_t>(position);
         if (typeEncoding != 0xFF) leb(position);
         const auto callEncoding = read<std::uint8_t>(position);
@@ -248,19 +263,38 @@ private:
         const auto tableSize = leb(position);
         if (tableSize > bytes.size()) throw RelinkerException("Strict filter: invalid LSDA table size", address);
         const auto tableEnd = checkedRangeEnd(position, tableSize);
+        if (!cacheLsdas && parsedCallSiteBytes + tableSize > bytes.size()) {
+            cacheLsdas = true;
+            parsedCallSiteBytes = 0;
+        }
+        if ((parsedCallSiteBytes += tableSize) > bytes.size()) throw RelinkerException("Strict filter: LSDA call-site tables exceed file", address);
+        const bool signedLanding = (callEncoding & 0x08) != 0;
         while (position < tableEnd) {
             encoded(position, callEncoding);
             encoded(position, callEncoding);
             const auto landing = encoded(position, callEncoding);
             leb(position);
-            if (landing != 0) {
-                const bool negative = (callEncoding & 0x08) != 0 && (landing >> 63) != 0;
-                if (negative ? landingBase < std::uint64_t{0} - landing : landing > std::numeric_limits<VirtualAddress>::max() - landingBase)
-                    throw RelinkerException("Strict filter: LSDA landing pad address overflowed", address);
-                region.ExtraTargets.push_back(landingBase + landing);
-            }
+            if (landing != 0) region.ExtraTargets.push_back(landingPad(address, signedLanding, landingBase, landing));
         }
         if (position != tableEnd) throw RelinkerException("Strict filter: LSDA call-site table size mismatch", address);
+        countLandingPads(address, region.ExtraTargets.size() - first);
+        if (!cacheLsdas) return;
+        std::vector<VirtualAddress> targets(region.ExtraTargets.begin() + static_cast<std::ptrdiff_t>(first), region.ExtraTargets.end());
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        for (auto& target : targets) target -= landingBase;
+        lsdaLandings.emplace(address, LsdaLandings{signedLanding, std::move(targets)});
+    }
+
+    VirtualAddress landingPad(VirtualAddress address, bool signedLanding, VirtualAddress landingBase, std::uint64_t landing) const {
+        const bool negative = signedLanding && (landing >> 63) != 0;
+        if (negative ? landingBase < std::uint64_t{0} - landing : landing > std::numeric_limits<VirtualAddress>::max() - landingBase)
+            throw RelinkerException("Strict filter: LSDA landing pad address overflowed", address);
+        return landingBase + landing;
+    }
+
+    void countLandingPads(VirtualAddress address, std::uint64_t count) {
+        if ((landingPads += count) > bytes.size()) throw RelinkerException("Strict filter: LSDA landing pads exceed file", address);
     }
 };
 

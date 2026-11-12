@@ -452,6 +452,88 @@ void exceptionLandingPads() {
     requireFailure([&] { Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {}); }, "Malformed LSDA was accepted");
 }
 
+std::pair<std::vector<std::uint8_t>, std::vector<Relinker::ProgramHeader>> lsdaImage(std::size_t count, const std::vector<std::uint8_t>& lsdas, const std::function<std::size_t(std::size_t)>& lsdaOf) {
+    const std::size_t lsda = 0x280;
+    const std::size_t fdes = lsda + lsdas.size();
+    const std::size_t header = fdes + 40 * count;
+    std::vector<std::uint8_t> bytes(header + 16 + 16 * count);
+    write<std::uint32_t>(bytes, 0x200, 25);
+    write<std::uint8_t>(bytes, 0x208, 1);
+    const std::vector<std::uint8_t> augmentation = {'z', 'P', 'L', 'R', 0, 1, 0x78, 16, 11, 0};
+    std::copy(augmentation.begin(), augmentation.end(), bytes.begin() + 0x209);
+    write<std::uint64_t>(bytes, 0x213, 0x1000);
+    std::copy(lsdas.begin(), lsdas.end(), bytes.begin() + lsda);
+    write<std::uint8_t>(bytes, header, 1);
+    write<std::uint8_t>(bytes, header + 2, 3);
+    write<std::uint64_t>(bytes, header + 4, 0x200);
+    write<std::uint32_t>(bytes, header + 12, static_cast<std::uint32_t>(count));
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto fde = fdes + 40 * index;
+        write<std::uint32_t>(bytes, fde, 36);
+        write<std::uint32_t>(bytes, fde + 4, static_cast<std::uint32_t>(fde + 4 - 0x200));
+        write<std::uint64_t>(bytes, fde + 8, 0x100000 + 0x20 * index);
+        write<std::uint64_t>(bytes, fde + 16, 0x20);
+        write<std::uint8_t>(bytes, fde + 24, 8);
+        write<std::uint64_t>(bytes, fde + 25, lsda + lsdaOf(index));
+        write<std::uint64_t>(bytes, header + 16 + 16 * index, 0x100000 + 0x20 * index);
+        write<std::uint64_t>(bytes, header + 24 + 16 * index, fde);
+    }
+    std::vector<Relinker::ProgramHeader> headers = {{1, 4, 0, 0, 0, bytes.size(), bytes.size(), 8}, {0x6474E550, 4, header, header, 0, 16 + 16 * count, 16 + 16 * count, 4}};
+    return {std::move(bytes), std::move(headers)};
+}
+
+std::vector<std::uint8_t> sharedLsda(std::size_t sites, const std::function<std::uint64_t(std::size_t)>& landingOf) {
+    const auto size = 5 * sites;
+    std::vector<std::uint8_t> lsda = {0xFF, 0xFF, 1, static_cast<std::uint8_t>((size & 0x7F) | 0x80), static_cast<std::uint8_t>(size >> 7)};
+    for (std::size_t index = 0; index < sites; ++index) {
+        const auto landing = landingOf(index);
+        lsda.insert(lsda.end(), {0, 1, static_cast<std::uint8_t>((landing & 0x7F) | 0x80), static_cast<std::uint8_t>(landing >> 7), 0});
+    }
+    return lsda;
+}
+
+void sharedExceptionLandingPads() {
+    for (const std::size_t sites : {std::size_t{4}, std::size_t{2048}}) {
+        const std::size_t count = 2048;
+        const auto [bytes, headers] = lsdaImage(count, sharedLsda(sites, [](std::size_t index) { return index % 3; }), [](std::size_t) { return std::size_t{0}; });
+        const auto functions = Relinker::UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {});
+        require(functions.size() == count, "A function sharing an LSDA was dropped");
+        std::size_t entries = 0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const std::uint64_t begin = 0x100000 + 0x20 * index;
+            const auto& targets = functions[index].ExtraTargets;
+            entries += targets.size();
+            require(functions[index].Begin == begin && functions[index].End == begin + 0x20 &&
+                    std::set<std::uint64_t>(targets.begin(), targets.end()) == std::set<std::uint64_t>{0x1000, begin + 1, begin + 2},
+                    "An LSDA shared by many functions gave a function the wrong landing pads");
+        }
+        require(entries <= bytes.size(), "An LSDA shared by many functions listed more landing pads than the input has bytes");
+    }
+    const auto [distinct, distinctHeaders] = lsdaImage(2048, sharedLsda(2048, [](std::size_t index) { return index + 1; }), [](std::size_t) { return std::size_t{0}; });
+    requireFailureMessage([&] { Relinker::UnusedNidFilter::ReadExceptionFunctions(distinct, distinctHeaders, {}, {}); },
+                          "LSDA landing pads exceed file", "Landing pads beyond the input size were accepted");
+    const std::size_t blocks = 512;
+    std::vector<std::uint8_t> overlapping;
+    for (std::size_t index = 0; index < blocks; ++index) {
+        const auto size = 9 * (blocks - 1 - index) + 4;
+        overlapping.insert(overlapping.end(), {1, 0, 1, 0, 1, static_cast<std::uint8_t>((size & 0x7F) | 0x80), static_cast<std::uint8_t>(size >> 7), 0, 0});
+    }
+    overlapping.insert(overlapping.end(), {0, 0});
+    const auto [overlap, overlapHeaders] = lsdaImage(blocks, overlapping, [](std::size_t index) { return 9 * index; });
+    requireFailureMessage([&] { Relinker::UnusedNidFilter::ReadExceptionFunctions(overlap, overlapHeaders, {}, {}); },
+                          "LSDA call-site tables exceed file", "Overlapping LSDA call-site tables beyond the input size were accepted");
+    std::vector<std::uint8_t> overflowing = {0xFF, 0xFF, 4, 0xCB, 0};
+    for (std::size_t index = 0; index < 3; ++index) {
+        std::vector<std::uint8_t> site(25);
+        write<std::uint64_t>(site, 8, 1);
+        write<std::uint64_t>(site, 16, std::numeric_limits<std::uint64_t>::max() - 0x100010);
+        overflowing.insert(overflowing.end(), site.begin(), site.end());
+    }
+    const auto [overflow, overflowHeaders] = lsdaImage(2, overflowing, [](std::size_t) { return std::size_t{0}; });
+    requireFailureMessage([&] { Relinker::UnusedNidFilter::ReadExceptionFunctions(overflow, overflowHeaders, {}, {}); },
+                          "LSDA landing pad address overflowed", "A shared LSDA landing pad that overflows for a later function was accepted");
+}
+
 void exceptionDataWithoutPersonality() {
     std::vector<std::uint8_t> bytes(0x400);
     write<std::uint32_t>(bytes, 0x200, 15);
@@ -1463,6 +1545,7 @@ int main() {
         exceptionLeb128Bounds();
         vectorInstructionLengths();
         exceptionLandingPads();
+        sharedExceptionLandingPads();
         exceptionDataWithoutPersonality();
         filterSegmentRelativeImports();
         segmentRelativeBaseAndReachability();
