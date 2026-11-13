@@ -1489,6 +1489,118 @@ static void CheckReservedRangeIsNotCommitted() {
     Require(sceKernelReleaseDirectMemory(phys, page) == 0);
 }
 
+static void CheckCommittedPoolPagesLeaveTheReservation() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelMemoryPoolExpand(0, 0x7fffffffffll, page * 4, 0, &phys) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelMemoryPoolReserve(nullptr, page * 4, 0, 0, &reserved) == 0 && reserved != nullptr);
+    auto* base = static_cast<unsigned char*>(reserved);
+    const auto start = reinterpret_cast<std::uintptr_t>(reserved);
+    Require(sceKernelMemoryPoolCommit(base + page, page, 0, 3, 0) == 0);
+    base[page] = 0x5a;
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(base + page, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.protection == 3 && info.start == start + page && info.end == start + page * 2);
+    int prot = -1;
+    Require(sceKernelQueryMemoryProtection(base + page, nullptr, nullptr, &prot) == 0 && prot == 3);
+    Require(sceKernelVirtualQuery(base, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.protection == 0 && info.start == start && info.end == start + page);
+    Require(sceKernelVirtualQuery(base + page * 2, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.protection == 0 && info.start == start + page * 2 && info.end == start + page * 4);
+    void* hinted = base + page;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0);
+    Require(hinted != base + page && base[page] == 0x5a);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(base + page, page, 0) == 0);
+    Require(sceKernelVirtualQuery(base + page, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.protection == 0);
+    hinted = base + page;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted != base + page);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(base + page, page, 3) == 0 && base[page] == 0x5a);
+    Require(sceKernelMemoryPoolCommit(base + page * 2, page, 0, 0, 0) == 0);
+    Require(sceKernelVirtualQuery(base + page * 2, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.protection == 0);
+    Require(sceKernelVirtualQuery(base + page * 3, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.start == start + page * 3 && info.end == start + page * 4);
+    Require(sceKernelMemoryPoolDecommit(base + page, page * 2, 0) == 0);
+    Require(sceKernelVirtualQuery(base + page, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.protection == 0 && info.start <= start + page && info.end >= start + page * 3);
+    void* rehinted = base + page;
+    Require(sceKernelMapFlexibleMemory(&rehinted, page, 3, 0) == 0 && rehinted == base + page);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reserved), page * 4) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 4) == 0);
+}
+
+static void CheckProtectedReservedPagesLeaveTheReservation() {
+    constexpr std::size_t page = 0x4000;
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 2, 0, 0) == 0 && reserved != nullptr);
+    auto* base = static_cast<unsigned char*>(reserved);
+    const auto start = reinterpret_cast<std::uintptr_t>(reserved);
+    Require(sceKernelMprotect(base, page, 3) == 0);
+    base[0] = 0x5a;
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(base, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.protection == 3);
+    Require(sceKernelVirtualQuery(base + page, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.start == start + page && info.end == start + page * 2);
+    Require(sceKernelMprotect(base, page, 0) == 0);
+    Require(sceKernelVirtualQuery(base, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.protection == 0);
+    void* hinted = base;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted != base);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(base, page, 3) == 0 && base[0] == 0x5a);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reserved), page * 2) == 0);
+}
+
+static void CheckDecommitKeepsMappingsOutsideThePool() {
+    constexpr std::size_t page = 0x4000;
+    void* mapped = nullptr;
+    Require(sceKernelMapFlexibleMemory(&mapped, page, 3, 0) == 0 && mapped != nullptr);
+    auto* bytes = static_cast<unsigned char*>(mapped);
+    bytes[0] = 0x77;
+    Require(sceKernelMemoryPoolDecommit(mapped, page, 0) == 0);
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(mapped, 0, &info, sizeof(info)) == 0 && info.is_committed);
+    void* hinted = mapped;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted != mapped);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(mapped, page, 3) == 0 && bytes[0] == 0x77);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped), page) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 2, 0, 0) == 0 && reserved != nullptr);
+    auto* base = static_cast<unsigned char*>(reserved);
+    void* flexible = base + page;
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0x10) == 0 && flexible == base + page);
+    base[page] = 0x66;
+    Require(sceKernelMemoryPoolDecommit(reserved, page * 2, 0) == 0);
+    hinted = base + page;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted != base + page);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(base + page, page, 3) == 0 && base[page] == 0x66);
+    hinted = base;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted == base);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reserved), page * 2) == 0);
+    std::int64_t phys = 0;
+    Require(sceKernelMemoryPoolExpand(0, 0x7fffffffffll, page, 0, &phys) == 0);
+    Require(sceKernelMemoryPoolReserve(nullptr, page, 0, 0, &reserved) == 0 && reserved != nullptr);
+    Require(sceKernelMemoryPoolCommit(reserved, page, 0, 3, 0) == 0);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reserved), page) == 0);
+    flexible = reserved;
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0x10) == 0 && flexible == reserved);
+    static_cast<unsigned char*>(reserved)[0] = 0x55;
+    Require(sceKernelMemoryPoolDecommit(reserved, page, 0) == 0);
+    hinted = reserved;
+    Require(sceKernelMapFlexibleMemory(&hinted, page, 3, 0) == 0 && hinted != reserved);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(hinted), page) == 0);
+    Require(sceKernelMprotect(reserved, page, 3) == 0 && static_cast<unsigned char*>(reserved)[0] == 0x55);
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(reserved), page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
 static void CheckNoOverwriteRefusesLiveMapping() {
     constexpr std::size_t page = 0x4000;
     constexpr int outOfMemory = static_cast<int>(0x8002000cu);
@@ -4408,6 +4520,9 @@ int main(int argc, char** argv) {
     CheckReservationHintWithoutRoomAbove();
     CheckFixedVirtualReservation();
     CheckReservedRangeIsNotCommitted();
+    CheckCommittedPoolPagesLeaveTheReservation();
+    CheckProtectedReservedPagesLeaveTheReservation();
+    CheckDecommitKeepsMappingsOutsideThePool();
     CheckHintInsideReservation();
     CheckNoOverwriteRefusesLiveMapping();
     CheckMlock();

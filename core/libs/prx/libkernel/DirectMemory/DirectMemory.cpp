@@ -550,6 +550,7 @@ struct DirectMemoryState {
     std::map<std::uintptr_t, ProtectedRange> protections;
     std::mutex reservationLock;
     std::map<std::uintptr_t, std::uintptr_t> reservations;
+    std::map<std::uintptr_t, std::uintptr_t> poolCommits;
 };
 
 DirectMemoryState& MemoryState() {
@@ -570,6 +571,7 @@ auto& g_protectionLock = MemoryState().protectionLock;
 auto& g_protections = MemoryState().protections;
 auto& g_reservationLock = MemoryState().reservationLock;
 auto& g_reservations = MemoryState().reservations;
+auto& g_poolCommits = MemoryState().poolCommits;
 
 void SplitPhysicalSpan(std::uint64_t at) {
     auto span = g_physicalSpans.upper_bound(at);
@@ -1059,18 +1061,43 @@ void EraseProtections(std::uintptr_t start, std::uintptr_t end, std::map<std::ui
     }
 }
 
+void EraseRanges(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t start, std::uintptr_t end, std::map<std::uintptr_t, std::uintptr_t>* erased = nullptr) {
+    auto it = ranges.lower_bound(start);
+    if (it != ranges.begin() && std::prev(it)->second > start) --it;
+    while (it != ranges.end() && it->first < end) {
+        const auto rangeStart = it->first;
+        const auto rangeEnd = it->second;
+        it = ranges.erase(it);
+        if (erased) erased->emplace(std::max(rangeStart, start), std::min(rangeEnd, end));
+        if (rangeStart < start) ranges.emplace(rangeStart, start);
+        if (rangeEnd > end) it = ranges.emplace(end, rangeEnd).first;
+    }
+}
+
 void EraseReservations(const void* addr, size_t len) {
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    std::lock_guard lock(g_reservationLock);
+    EraseRanges(g_reservations, start, start + len);
+    EraseRanges(g_poolCommits, start, start + len);
+}
+
+void ProtectReservations(const void* addr, size_t len, int prot, PoolCommitment commitment) {
     const auto start = reinterpret_cast<std::uintptr_t>(addr);
     const auto end = start + len;
     std::lock_guard lock(g_reservationLock);
-    auto it = g_reservations.lower_bound(start);
-    if (it != g_reservations.begin() && std::prev(it)->second > start) --it;
-    while (it != g_reservations.end() && it->first < end) {
-        const auto rangeStart = it->first;
-        const auto rangeEnd = it->second;
-        it = g_reservations.erase(it);
-        if (rangeStart < start) g_reservations.emplace(rangeStart, start);
-        if (rangeEnd > end) it = g_reservations.emplace(end, rangeEnd).first;
+    if (commitment == PoolCommitment::Commit) {
+        EraseRanges(g_reservations, start, end, &g_poolCommits);
+    } else if (commitment == PoolCommitment::Decommit) {
+        std::map<std::uintptr_t, std::uintptr_t> decommitted;
+        EraseRanges(g_poolCommits, start, end, &decommitted);
+        for (auto it = decommitted.begin(); it != decommitted.end();) {
+            const auto rangeStart = it->first;
+            auto rangeEnd = it->second;
+            for (++it; it != decommitted.end() && it->first == rangeEnd; ++it) rangeEnd = it->second;
+            g_reservations.emplace(rangeStart, rangeEnd);
+        }
+    } else if (prot != 0) {
+        EraseRanges(g_reservations, start, end);
     }
 }
 
@@ -1485,7 +1512,7 @@ static int FindImagesOverlapping(dl_phdr_info* image, std::size_t, void* data) {
 }
 #endif
 
-int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) {
+int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart, PoolCommitment commitment) {
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
     constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
@@ -1584,12 +1611,13 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
 #endif
         });
         RecordProtection(span, spanBytes, prot);
+        ProtectReservations(span, spanBytes, prot, commitment);
     }
     return 0;
 }
 
-int DoMtypeprotect(const void* addr, size_t len, int type, int prot, bool requireMappedStart) {
-    const int result = DoMprotect(addr, len, prot, requireMappedStart);
+int DoMtypeprotect(const void* addr, size_t len, int type, int prot, bool requireMappedStart, PoolCommitment commitment) {
+    const int result = DoMprotect(addr, len, prot, requireMappedStart, commitment);
     if (result != 0) return result;
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
     constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
